@@ -88,32 +88,42 @@ def expected_log_return(true_prob: float, market_price: float) -> float:
 
 def get_true_probability(market_question: str, market_price: float,
                           yes_price: float, no_price: float,
-                          volume: str = "?", end_date: str = "?") -> tuple:
+                          volume: str = "?", end_date: str = "?",
+                          ta_data: dict = None) -> tuple:
     """
     Pede ao Claude para estimar a probabilidade real do evento.
+    Usa dados tecnicos do Binance para embasar a decisao.
     Retorna (true_prob, confidence)
     """
-    prompt = f"""You are a quantitative prediction market analyst.
+    ta_section = ""
+    if ta_data:
+        ta_section = f"""
+Live BTC Technical Data (from Binance, right now):
+- BTC Price     : ${ta_data.get('price', 0):,.2f}
+- Momentum (5m) : {ta_data.get('momentum', 0):+.4f}% vs window open
+- RSI (14)      : {ta_data.get('rsi', 50):.1f}
+- EMA9 vs EMA21 : {'BULL (EMA9 > EMA21)' if ta_data.get('ema_bull') else 'BEAR (EMA9 < EMA21)'}
+- VWAP          : BTC is {'ABOVE' if ta_data.get('above_vwap') else 'BELOW'} VWAP
+- Trend (last 3 candles): {'+' if ta_data.get('trend', 0) > 0 else ''}{ta_data.get('trend', 0)} ({'UP' if ta_data.get('trend',0)>0 else 'DOWN' if ta_data.get('trend',0)<0 else 'FLAT'})
+- Volume ratio  : {ta_data.get('vol_ratio', 1):.2f}x average
+- TA Score      : {ta_data.get('score', 0):+.3f} ({'bullish' if ta_data.get('score',0)>0 else 'bearish'})
+"""
 
-Analyze this Polymarket market:
-Question: {market_question}
-Current YES price: {yes_price:.3f} ({yes_price*100:.1f}¢)
-Current NO price:  {no_price:.3f} ({no_price*100:.1f}¢)
-Volume: {volume}
-Close date: {end_date}
+    prompt = f"""You are a quantitative crypto trader specializing in short-term BTC price prediction.
 
+Market: {market_question}
+Current YES (UP) price: {yes_price*100:.1f}¢ — market implies {yes_price*100:.0f}% chance BTC goes UP
+Current NO (DOWN) price: {no_price*100:.1f}¢ — market implies {no_price*100:.0f}% chance BTC goes DOWN
+{ta_section}
 Your task:
-1. Estimate the REAL probability of YES (0.00 - 1.00)
-2. Consider base rates for similar events
-3. Factor in current market conditions and any news you know
-4. Be calibrated - if you say 70%, 7 out of 10 similar assessments should be correct
+1. Based on the technical data above, estimate the TRUE probability that BTC goes UP in this 5-minute window
+2. If TA score is strongly positive (>3) → UP is more likely. Strongly negative (<-3) → DOWN more likely
+3. If score is weak (-2 to +2) → close to 50/50, say low confidence
+4. Only say "high" confidence if score is extreme (>4 or <-4) AND multiple indicators align
+5. Be calibrated — don't force a prediction if data is mixed
 
-For BTC 5-minute markets:
-- These resolve based on whether BTC price at end > price at start of the 5-min window
-- Consider recent momentum, volatility, and market microstructure
-
-Respond STRICTLY in JSON:
-{{"probability": 0.XX, "confidence": "high/medium/low", "reasoning": "one sentence max"}}"""
+Respond STRICTLY in JSON (no other text):
+{{"probability": 0.XX, "confidence": "high/medium/low", "reasoning": "one sentence"}}"""
 
     try:
         resp = get_claude().messages.create(
@@ -134,6 +144,79 @@ Respond STRICTLY in JSON:
     except Exception as e:
         log(f"⚠️  Claude erro: {e}")
         return 0.5, "low", "erro"
+
+
+# ── Analise Tecnica Binance ──────────────────────────────────
+
+def get_ta_data(window_ts: int) -> dict:
+    """Coleta indicadores tecnicos do BTC via Binance."""
+    try:
+        r = requests.get("https://api.binance.com/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 30}, timeout=8)
+        r.raise_for_status()
+        candles = [{"open": float(c[1]), "high": float(c[2]), "low": float(c[3]),
+                    "close": float(c[4]), "volume": float(c[5])} for c in r.json()]
+        if len(candles) < 10:
+            return {}
+
+        closes  = [c["close"] for c in candles]
+        volumes = [c["volume"] for c in candles]
+        current = closes[-1]
+
+        # Momentum vs abertura da janela
+        r2 = requests.get("https://api.binance.com/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "5m",
+                    "startTime": window_ts * 1000, "limit": 1}, timeout=5)
+        open_p = float(r2.json()[0][1]) if r2.ok and r2.json() else candles[-6]["open"]
+        momentum = (current - open_p) / open_p * 100
+
+        # RSI
+        gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
+        losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
+        ag = sum(gains[-14:]) / 14
+        al = sum(losses[-14:]) / 14
+        rsi = 100.0 if al == 0 else 100 - (100 / (1 + ag/al))
+
+        # EMA
+        def ema(vals, p):
+            k = 2/(p+1); e = sum(vals[:p])/p
+            for v in vals[p:]: e = v*k + e*(1-k)
+            return e
+        ema9  = ema(closes, 9)
+        ema21 = ema(closes, 21)
+
+        # VWAP
+        tv = sum(c["volume"] for c in candles[-10:])
+        vwap = sum(((c["high"]+c["low"]+c["close"])/3)*c["volume"]
+                   for c in candles[-10:]) / tv if tv else current
+
+        # Trend e Volume
+        trend    = sum(1 if closes[i]>closes[i-1] else -1 for i in range(-3, 0))
+        avg_vol  = sum(volumes[-11:-1]) / 10
+        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
+
+        # Score TA
+        rsi_s  = 1 if rsi > 60 else (-1 if rsi < 40 else 0)
+        vwap_s = 1 if current > vwap else -1
+        ema_s  = 1 if ema9 > ema21 else -1
+        body_s = 1 if candles[-1]["close"] > candles[-1]["open"] else -1
+        score  = momentum * 3.0 + trend * 1.5 + rsi_s * 0.8 + vwap_s * 1.0 + body_s * 1.0 + ema_s * 0.7
+        if vol_ratio > 1.3:
+            score *= 1.2
+
+        return {
+            "price":      current,
+            "momentum":   round(momentum, 4),
+            "rsi":        round(rsi, 1),
+            "ema_bull":   ema9 > ema21,
+            "above_vwap": current > vwap,
+            "trend":      trend,
+            "vol_ratio":  round(vol_ratio, 2),
+            "score":      round(score, 3),
+        }
+    except Exception as e:
+        log(f"⚠️  TA erro: {e}")
+        return {}
 
 
 # ── Preco atual do token ──────────────────────────────────────
@@ -331,7 +414,11 @@ class AnalysisAgent:
 
             log(f"  💰 UP={yes_price*100:.1f}¢  DOWN={no_price*100:.1f}¢")
 
-            # ── Passo 2: Claude estima probabilidade real ─────────
+            # ── Passo 2: Coleta TA e Claude estima probabilidade ────
+            ta = get_ta_data(wts)
+            if ta:
+                log(f"  📊 BTC=${ta['price']:,.0f} | Score={ta['score']:+.1f} | RSI={ta['rsi']} | Mom={ta['momentum']:+.4f}%")
+
             log(f"  🤖 Consultando Claude...")
             true_prob, confidence, reasoning = get_true_probability(
                 market_question=market["question"],
@@ -339,7 +426,8 @@ class AnalysisAgent:
                 yes_price=yes_price,
                 no_price=no_price,
                 volume=str(info.get("volume", "?")),
-                end_date=str(info.get("end_date", "?"))
+                end_date=str(info.get("end_date", "?")),
+                ta_data=ta if ta else None
             )
 
             log(f"  🧠 Claude: prob={true_prob:.0%} | conf={confidence} | {reasoning[:60]}")
