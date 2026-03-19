@@ -396,7 +396,7 @@ class AnalysisAgent:
 
             if window_key in self._analyzed_windows:
                 if not acted:
-                    log(f"⏳ T-{secs}s (analisado) | {market['question'][:50]}")
+                    log(f"⏳ T-{secs}s | {market['question'][:50]}")
                     acted = True
                 continue
 
@@ -472,7 +472,8 @@ class AnalysisAgent:
                 continue
 
             if not can_bet(cid, bets, size):
-                log(f"  ⛔ Limite de ${config.MAX_PER_MARKET_USD:.0f} atingido")
+                self._analyzed_windows.add(window_key)
+                log(f"  ⛔ Limite de ${config.MAX_PER_MARKET_USD:.0f} atingido neste mercado")
                 continue
 
             # ── Resultado final ───────────────────────────────────
