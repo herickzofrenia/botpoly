@@ -17,7 +17,7 @@ MARKETS_TO_ANALYZE   = 10
 TOP_PICKS_COUNT      = 3
 
 BET_SIZE_USD       = 1.0
-MAX_PER_MARKET_USD = 2.0   # limite POR MERCADO (ex: 3:55-4:00 e 4:00-4:05 sao independentes)
+MAX_PER_MARKET_USD = 5.0   # limite POR MERCADO (cada janela de 5min e independente)
 MIN_CONFIDENCE     = 0.65
 DRY_RUN            = True
 
